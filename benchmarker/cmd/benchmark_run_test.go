@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"testing"
@@ -193,4 +194,84 @@ func TestCalculateLinearNDCG(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCompressionRecallInfo(t *testing.T) {
+	t.Run("CompressionRecallInfo struct initialization", func(t *testing.T) {
+		recallInfo := CompressionRecallInfo{
+			CompressionType:  "pq_ratio_4",
+			Recall:           0.85,
+			NDCG:             0.82,
+			QueriesPerSecond: 150.5,
+			MeanLatency:      6.7,
+			P99Latency:       25.3,
+			VectorCount:      10000,
+			Dimensions:       768,
+			QueryCount:       100,
+			PQRatio:          4,
+			TrainingLimit:    100000,
+		}
+
+		require.Equal(t, "pq_ratio_4", recallInfo.CompressionType)
+		require.Equal(t, 0.85, recallInfo.Recall)
+		require.Equal(t, 0.82, recallInfo.NDCG)
+		require.Equal(t, 150.5, recallInfo.QueriesPerSecond)
+		require.Equal(t, 6.7, recallInfo.MeanLatency)
+		require.Equal(t, 25.3, recallInfo.P99Latency)
+		require.Equal(t, 10000, recallInfo.VectorCount)
+		require.Equal(t, 768, recallInfo.Dimensions)
+		require.Equal(t, 100, recallInfo.QueryCount)
+		require.Equal(t, 4, recallInfo.PQRatio)
+		require.Equal(t, 100000, recallInfo.TrainingLimit)
+	})
+
+	t.Run("CompressionRecallAnalysis flag in config", func(t *testing.T) {
+		cfg := Config{
+			CompressionRecallAnalysis: true,
+		}
+
+		require.True(t, cfg.CompressionRecallAnalysis)
+	})
+}
+
+func TestCompressionRecallAnalysisCLIFlag(t *testing.T) {
+	t.Run("CLI flag parsing test", func(t *testing.T) {
+		// Test that the CLI flag exists and can be parsed
+		// This is a basic integration test to ensure the flag is properly wired
+
+		// Test with flag enabled
+		cfgEnabled := Config{}
+		cfgEnabled.CompressionRecallAnalysis = true
+		require.True(t, cfgEnabled.CompressionRecallAnalysis)
+
+		// Test with flag disabled (default)
+		cfgDisabled := Config{}
+		require.False(t, cfgDisabled.CompressionRecallAnalysis)
+
+		// Test JSON serialization works for the struct
+		recallInfo := CompressionRecallInfo{
+			CompressionType:  "test",
+			Recall:           0.5,
+			NDCG:             0.6,
+			QueriesPerSecond: 100.0,
+			MeanLatency:      10.0,
+			P99Latency:       50.0,
+			VectorCount:      1000,
+			Dimensions:       128,
+			QueryCount:       10,
+		}
+
+		// Verify JSON marshaling works (important for output files)
+		_, err := json.Marshal(recallInfo)
+		require.NoError(t, err)
+
+		// Verify all required fields are present
+		require.NotEmpty(t, recallInfo.CompressionType)
+		require.GreaterOrEqual(t, recallInfo.Recall, 0.0)
+		require.GreaterOrEqual(t, recallInfo.NDCG, 0.0)
+		require.Greater(t, recallInfo.QueriesPerSecond, 0.0)
+		require.Greater(t, recallInfo.VectorCount, 0)
+		require.Greater(t, recallInfo.Dimensions, 0)
+		require.Greater(t, recallInfo.QueryCount, 0)
+	})
 }

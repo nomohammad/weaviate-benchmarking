@@ -75,6 +75,9 @@ type Config struct {
 	MemoryMonitoringEnabled  bool
 	MemoryMonitoringInterval int
 	MemoryMonitoringFile     string
+	ExperimentName           string
+	CompressionSizeAnalysis  bool
+	CompressionRecallAnalysis bool
 }
 
 func (c *Config) Validate() error {

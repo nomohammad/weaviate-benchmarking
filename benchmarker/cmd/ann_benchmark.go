@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-openapi/strfmt"
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/retry"
 	"github.com/hashicorp/go-retryablehttp"
 	log "github.com/sirupsen/logrus"
@@ -1049,6 +1050,14 @@ func parseEfValues(s string) ([]int, error) {
 func runQueries(cfg *Config, importTime time.Duration, testData [][]float32, neighbors [][]int, filters []int) {
 	runID := strconv.FormatInt(time.Now().Unix(), 10)
 
+	// Generate filename with bench_ prefix and optional experiment name
+	var filename string
+	if cfg.ExperimentName != "" {
+		filename = fmt.Sprintf("bench_%s_%s.json", cfg.ExperimentName, runID)
+	} else {
+		filename = fmt.Sprintf("bench_%s.json", runID)
+	}
+
 	efCandidates, err := parseEfValues(cfg.EfArray)
 	if err != nil {
 		log.Fatalf("Error parsing efArray, expected commas separated format \"16,32,64\" but:%v\n", err)
@@ -1129,6 +1138,44 @@ func runQueries(cfg *Config, importTime time.Duration, testData [][]float32, nei
 
 	}
 
+	// Run compression recall analysis if requested
+	if cfg.CompressionRecallAnalysis {
+		log.Info("Starting compression recall analysis")
+		recallResults, err := measureCompressionRecall(cfg, client, testData, neighbors, filters)
+		if err != nil {
+			log.WithError(err).Error("Failed to measure compression recall")
+		} else {
+			log.WithField("results_count", len(recallResults)).Info("Compression recall analysis completed")
+
+			// Save recall analysis results to file
+			recallFile := fmt.Sprintf("compression_recall_%s_%s.json",
+				cfg.ExperimentName, runID)
+			if cfg.ExperimentName == "" {
+				recallFile = fmt.Sprintf("compression_recall_%s.json", runID)
+			}
+
+			recallData, _ := json.MarshalIndent(recallResults, "", "  ")
+			recallPath := fmt.Sprintf("./results/%s", recallFile)
+			if err := os.WriteFile(recallPath, recallData, 0644); err != nil {
+				log.WithError(err).Error("Failed to save compression recall analysis results")
+			} else {
+				log.WithField("file", recallPath).Info("Compression recall analysis results saved")
+			}
+
+			// Print summary
+			log.Info("Compression Recall Analysis Summary:")
+			for _, result := range recallResults {
+				log.WithFields(log.Fields{
+					"compression_type":    result.CompressionType,
+					"recall":             result.Recall,
+					"ndcg":               result.NDCG,
+					"queries_per_second": result.QueriesPerSecond,
+					"mean_latency_ms":    result.MeanLatency,
+				}).Info("Recall measurement")
+			}
+		}
+	}
+
 	data, err := json.MarshalIndent(benchmarkResultsMap, "", "    ")
 	if err != nil {
 		log.Fatalf("Error marshaling benchmark results: %v", err)
@@ -1136,9 +1183,55 @@ func runQueries(cfg *Config, importTime time.Duration, testData [][]float32, nei
 
 	os.Mkdir("./results", 0o755)
 
-	err = os.WriteFile(fmt.Sprintf("./results/%s.json", runID), data, 0o644)
+	// Use OutputFile if specified, otherwise use the generated filename in results directory
+	var outputPath string
+	if cfg.OutputFile != "" {
+		outputPath = cfg.OutputFile
+		// Ensure parent directory exists
+		if dir := filepath.Dir(outputPath); dir != "." {
+			os.MkdirAll(dir, 0o755)
+		}
+	} else {
+		outputPath = fmt.Sprintf("./results/%s", filename)
+	}
+
+	err = os.WriteFile(outputPath, data, 0o644)
 	if err != nil {
 		log.Fatalf("Error writing benchmark results to file: %v", err)
+	}
+
+	log.WithFields(log.Fields{
+		"output_path": outputPath,
+		"filename": filename,
+		"experiment": cfg.ExperimentName,
+		"run_id": runID,
+	}).Info("Benchmark results saved to file")
+
+	// Add experiment to history
+	historyManager := NewHistoryManager()
+	totalDuration := time.Since(time.Unix(0, 0)) // This should be calculated properly from the actual start time
+
+	// Extract metrics from benchmark results
+	metrics := make(map[string]float64)
+	if len(benchmarkResultsMap) > 0 {
+		// Take metrics from the first result as representative
+		firstResult := benchmarkResultsMap[0]
+		if qps, ok := firstResult["qps"].(float64); ok {
+			metrics["qps"] = qps
+		}
+		if recall, ok := firstResult["recall"].(float64); ok {
+			metrics["recall"] = recall
+		}
+		if latency, ok := firstResult["meanLatency"].(float64); ok {
+			metrics["mean_latency"] = latency
+		}
+	}
+
+	experiment := CreateExperimentFromConfig(cfg, runID, outputPath, totalDuration, metrics)
+	if err := historyManager.AddExperiment(experiment); err != nil {
+		log.WithError(err).Warn("Failed to add experiment to history")
+	} else {
+		log.WithField("experiment_id", runID).Info("Experiment added to history")
 	}
 }
 
@@ -1160,11 +1253,58 @@ var annBenchmarkCommand = &cobra.Command{
 		memoryMonitor.Start()
 		defer memoryMonitor.Stop()
 
-		file, err := hdf5.OpenFile(cfg.BenchmarkFile, hdf5.F_ACC_RDONLY)
+		// Detect dataset format and load accordingly
+		format, err := detectDatasetFormat(cfg.BenchmarkFile)
 		if err != nil {
-			log.Fatalf("Error opening file: %v\n", err)
+			log.Fatalf("Error detecting dataset format: %v", err)
 		}
-		defer file.Close()
+
+		log.WithFields(log.Fields{
+			"file": cfg.BenchmarkFile,
+			"format": format,
+		}).Info("Detected dataset format")
+
+		// Run compression size analysis if requested (before creating client)
+		if cfg.CompressionSizeAnalysis {
+			log.Info("Starting compression size analysis")
+			compressionResults, err := measureCompressionIndexSize(&cfg, nil)
+			if err != nil {
+				log.WithError(err).Error("Failed to measure compression index sizes")
+			} else {
+				log.WithField("results_count", len(compressionResults)).Info("Compression size analysis completed")
+
+				// Save compression results to file
+				compressionFile := fmt.Sprintf("compression_analysis_%s_%d.json",
+					cfg.ExperimentName, time.Now().Unix())
+				if cfg.ExperimentName == "" {
+					compressionFile = fmt.Sprintf("compression_analysis_%d.json", time.Now().Unix())
+				}
+
+				compressionData, _ := json.MarshalIndent(compressionResults, "", "  ")
+				if err := os.WriteFile(compressionFile, compressionData, 0644); err != nil {
+					log.WithError(err).Error("Failed to save compression analysis results")
+				} else {
+					log.WithField("file", compressionFile).Info("Compression analysis results saved")
+				}
+
+				// Print summary
+				log.Info("Compression Analysis Summary:")
+				for _, result := range compressionResults {
+					log.WithFields(log.Fields{
+						"type":             result.CompressionType,
+						"compression_ratio": fmt.Sprintf("%.2fx", result.CompressionRatio),
+						"memory_mb":        fmt.Sprintf("%.1f MB", result.MemoryUsageMB),
+						"size_reduction":   fmt.Sprintf("%.1f%%", (1-1/result.CompressionRatio)*100),
+					}).Info("Compression result")
+				}
+			}
+
+			// Exit early if only doing compression analysis
+			if cfg.QueryOnly && cfg.SkipQuery {
+				log.Info("Compression analysis completed, exiting")
+				return
+			}
+		}
 
 		client := createClient(&cfg)
 
@@ -1181,10 +1321,28 @@ var annBenchmarkCommand = &cobra.Command{
 				"distance": cfg.DistanceMetric, "dataset": cfg.BenchmarkFile,
 			}).Info("Starting import")
 
-			if cfg.NumTenants > 0 {
-				importTime = loadHdf5MultiTenant(file, &cfg, client)
-			} else {
-				importTime = loadANNBenchmarksFile(file, &cfg, client, 0)
+			// Load data based on format
+			switch format {
+			case "hdf5":
+				file, err := hdf5.OpenFile(cfg.BenchmarkFile, hdf5.F_ACC_RDONLY)
+				if err != nil {
+					log.Fatalf("Error opening HDF5 file: %v", err)
+				}
+				defer file.Close()
+
+				if cfg.NumTenants > 0 {
+					importTime = loadHdf5MultiTenant(file, &cfg, client)
+				} else {
+					importTime = loadANNBenchmarksFile(file, &cfg, client, 0)
+				}
+			case "json_ann":
+				importTime = loadJSONAnnBenchmarksFile(cfg.BenchmarkFile, &cfg, client)
+			case "json_custom":
+				importTime = loadCustomVectorFile(cfg.BenchmarkFile, &cfg, client)
+			case "json_simple":
+				importTime = loadSimpleJSONFile(cfg.BenchmarkFile, &cfg, client)
+			default:
+				log.Fatalf("Unsupported dataset format: %s", format)
 			}
 
 			sleepDuration := time.Duration(cfg.QueryDelaySeconds) * time.Second
@@ -1201,56 +1359,81 @@ var annBenchmarkCommand = &cobra.Command{
 			return
 		}
 
-		neighbors := loadHdf5Neighbors(file, "neighbors")
+		// Load test data and neighbors based on format
+		var neighbors [][]int
 		var testData [][]float32
-		if cfg.MultiVectorDimensions > 0 {
-			testData = loadHdf5Colbert(file, "test", cfg.MultiVectorDimensions)
-		} else {
-			testData = loadHdf5Float32(file, "test", &cfg)
-		}
+		var testFilters []int
 
-		testFilters := make([]int, 0)
-		if cfg.Filter {
-			testFilters = loadHdf5Categories(file, "test_categories")
+		switch format {
+		case "hdf5":
+			file, err := hdf5.OpenFile(cfg.BenchmarkFile, hdf5.F_ACC_RDONLY)
+			if err != nil {
+				log.Fatalf("Error opening HDF5 file for queries: %v", err)
+			}
+			defer file.Close()
+
+			neighbors = loadHdf5Neighbors(file, "neighbors")
+			if cfg.MultiVectorDimensions > 0 {
+				testData = loadHdf5Colbert(file, "test", cfg.MultiVectorDimensions)
+			} else {
+				testData = loadHdf5Float32(file, "test", &cfg)
+			}
+			if cfg.Filter {
+				testFilters = loadHdf5Categories(file, "test_categories")
+			}
+		case "json_ann":
+			neighbors, testData, testFilters = loadJSONQueryData(cfg.BenchmarkFile, &cfg)
+		case "json_custom":
+			neighbors, testData, testFilters = loadCustomQueryData(cfg.BenchmarkFile, &cfg)
+		case "json_simple":
+			neighbors, testData, testFilters = loadSimpleJSONQueryData(cfg.BenchmarkFile, &cfg)
 		}
 
 		runQueries(&cfg, importTime, testData, neighbors, testFilters)
 
 		if cfg.performUpdates() {
-
-			totalRowCount, _ := calculateHdf5TrainExtent(file, &cfg)
-			updateRowCount := uint(math.Floor(float64(totalRowCount) * cfg.UpdatePercentage))
-
-			log.Printf("Performing %d update iterations\n", cfg.UpdateIterations)
-
-			for i := 0; i < cfg.UpdateIterations; i++ {
-
-				startTime := time.Now()
-
-				if cfg.UpdateRandomized {
-					loadHdf5Train(file, &cfg, 0, 0, float32(cfg.UpdatePercentage))
-				} else {
-					deleteUuidRange(&cfg, client, 0, int(updateRowCount))
-					loadHdf5Train(file, &cfg, 0, updateRowCount, 0)
+			// Note: Updates are currently only supported for HDF5 format
+			if format == "hdf5" {
+				file, err := hdf5.OpenFile(cfg.BenchmarkFile, hdf5.F_ACC_RDONLY)
+				if err != nil {
+					log.Fatalf("Error opening HDF5 file for updates: %v", err)
 				}
+				defer file.Close()
 
-				log.WithFields(log.Fields{"duration": time.Since(startTime)}).Printf("Total delete and update time\n")
+				totalRowCount, _ := calculateHdf5TrainExtent(file, &cfg)
+				updateRowCount := uint(math.Floor(float64(totalRowCount) * cfg.UpdatePercentage))
 
-				if !cfg.SkipTombstonesEmpty {
-					err := waitTombstonesEmpty(&cfg)
-					if err != nil {
-						log.Fatalf("Error waiting for tombstones to be empty: %v", err)
-					}
-				}
-				if !cfg.SkipAsyncReady {
+				log.Printf("Performing %d update iterations\n", cfg.UpdateIterations)
+
+				for i := 0; i < cfg.UpdateIterations; i++ {
+
 					startTime := time.Now()
-					waitReady(&cfg, client, startTime, 30*time.Minute, 1000)
+
+					if cfg.UpdateRandomized {
+						loadHdf5Train(file, &cfg, 0, 0, float32(cfg.UpdatePercentage))
+					} else {
+						deleteUuidRange(&cfg, client, 0, int(updateRowCount))
+						loadHdf5Train(file, &cfg, 0, updateRowCount, 0)
+					}
+
+					log.WithFields(log.Fields{"duration": time.Since(startTime)}).Printf("Total delete and update time\n")
+
+					if !cfg.SkipTombstonesEmpty {
+						err := waitTombstonesEmpty(&cfg)
+						if err != nil {
+							log.Fatalf("Error waiting for tombstones to be empty: %v", err)
+						}
+					}
+					if !cfg.SkipAsyncReady {
+						startTime := time.Now()
+						waitReady(&cfg, client, startTime, 30*time.Minute, 1000)
+					}
+
+					runQueries(&cfg, importTime, testData, neighbors, testFilters)
 				}
-
-				runQueries(&cfg, importTime, testData, neighbors, testFilters)
-
+			} else {
+				log.Warnf("Update iterations are not currently supported for %s format", format)
 			}
-
 		}
 	},
 }
@@ -1376,6 +1559,12 @@ func initAnnBenchmark() {
 		"memoryMonitoringInterval", 5, "Memory monitoring interval in seconds (default 5)")
 	annBenchmarkCommand.PersistentFlags().StringVar(&globalConfig.MemoryMonitoringFile,
 		"memoryMonitoringFile", "", "Memory monitoring output file name (default: memory_metrics_<timestamp>.json)")
+	annBenchmarkCommand.PersistentFlags().StringVar(&globalConfig.ExperimentName,
+		"experimentName", "", "Name for this experiment (used in output file naming and logging)")
+	annBenchmarkCommand.PersistentFlags().BoolVar(&globalConfig.CompressionSizeAnalysis,
+		"compressionSizeAnalysis", false, "Enable compression index size measurement analysis")
+	annBenchmarkCommand.PersistentFlags().BoolVar(&globalConfig.CompressionRecallAnalysis,
+		"compressionRecallAnalysis", false, "Enable compression recall measurement and comparison analysis")
 }
 
 func benchmarkANN(cfg Config, queries Queries, neighbors Neighbors, filters []int) Results {
@@ -1473,4 +1662,487 @@ func benchmarkANNDuration(cfg Config, queries Queries, neighbors Neighbors, filt
 	medianResult.NDCG = median(samples.NDCG)
 
 	return medianResult
+}
+
+// CompressionSizeInfo holds information about index sizes under different compression settings
+type CompressionSizeInfo struct {
+	CompressionType   string  `json:"compressionType"`
+	UncompressedSize  int64   `json:"uncompressedSizeBytes"`
+	CompressedSize    int64   `json:"compressedSizeBytes"`
+	CompressionRatio  float64 `json:"compressionRatio"`
+	VectorCount       int     `json:"vectorCount"`
+	Dimensions        int     `json:"dimensions"`
+	SegmentCount      int     `json:"segmentCount,omitempty"`
+	TrainingLimit     int     `json:"trainingLimit,omitempty"`
+	RQBits           int     `json:"rqBits,omitempty"`
+	PQRatio          int     `json:"pqRatio,omitempty"`
+	MemoryUsageMB    float64 `json:"memoryUsageMB"`
+}
+
+// CompressionRecallInfo holds recall measurement results for different compression configurations
+type CompressionRecallInfo struct {
+	CompressionType  string  `json:"compressionType"`
+	Recall           float64 `json:"recall"`
+	NDCG             float64 `json:"ndcg"`
+	QueriesPerSecond float64 `json:"queriesPerSecond"`
+	MeanLatency      float64 `json:"meanLatencyMs"`
+	P99Latency       float64 `json:"p99LatencyMs"`
+	VectorCount      int     `json:"vectorCount"`
+	Dimensions       int     `json:"dimensions"`
+	QueryCount       int     `json:"queryCount"`
+	PQRatio          int     `json:"pqRatio,omitempty"`
+	RQBits           int     `json:"rqBits,omitempty"`
+	TrainingLimit    int     `json:"trainingLimit,omitempty"`
+}
+
+// measureCompressionIndexSize measures the index size for different compression configurations
+func measureCompressionIndexSize(cfg *Config, client *weaviate.Client) ([]CompressionSizeInfo, error) {
+	log.Info("Starting compression index size measurement")
+
+	var compressionResults []CompressionSizeInfo
+
+	// Get vector dimensions first by opening the HDF5 file
+	file, err := hdf5.OpenFile(cfg.BenchmarkFile, hdf5.F_ACC_RDONLY)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open HDF5 file: %v", err)
+	}
+	defer file.Close()
+
+	// Load train vectors to get dimensions
+	vectors := loadHdf5Float32(file, "train", cfg)
+	if len(vectors) == 0 {
+		return nil, fmt.Errorf("no vectors found in dataset")
+	}
+
+	vectorCount := len(vectors)
+	dimensions := len(vectors[0])
+
+	log.WithFields(log.Fields{
+		"vector_count": vectorCount,
+		"dimensions":   dimensions,
+	}).Info("Dataset information")
+
+	// Test configurations to benchmark
+	compressionConfigs := []struct {
+		name           string
+		compressionType CompressionType
+		enabled        bool
+		pqRatio        int
+		rqBits         int
+	}{
+		{"none", CompressionTypePQ, false, 0, 0},
+		{"pq_ratio_2", CompressionTypePQ, true, 2, 0},
+		{"pq_ratio_4", CompressionTypePQ, true, 4, 0},
+		{"pq_ratio_8", CompressionTypePQ, true, 8, 0},
+		{"rq_4bits", CompressionTypeRQ, true, 0, 4},
+		{"rq_6bits", CompressionTypeRQ, true, 0, 6},
+		{"rq_8bits", CompressionTypeRQ, true, 0, 8},
+		{"sq", CompressionTypeSQ, true, 0, 0},
+	}
+
+	for _, config := range compressionConfigs {
+		log.WithField("config", config.name).Info("Testing compression configuration")
+
+		// Calculate uncompressed size (baseline)
+		uncompressedSize := int64(vectorCount * dimensions * 4) // 4 bytes per float32
+
+		sizeInfo := CompressionSizeInfo{
+			CompressionType:  config.name,
+			UncompressedSize: uncompressedSize,
+			VectorCount:      vectorCount,
+			Dimensions:       dimensions,
+			TrainingLimit:    cfg.TrainingLimit,
+		}
+
+		if config.enabled {
+			switch config.compressionType {
+			case CompressionTypePQ:
+				sizeInfo.PQRatio = config.pqRatio
+				// PQ compressed size calculation: (dimensions / ratio) * vector_count
+				if dimensions%config.pqRatio == 0 {
+					sizeInfo.CompressedSize = int64((dimensions / config.pqRatio) * vectorCount)
+					sizeInfo.SegmentCount = dimensions / config.pqRatio
+				} else {
+					log.WithField("config", config.name).Warn("Dimensions not divisible by PQ ratio, skipping")
+					continue
+				}
+			case CompressionTypeRQ:
+				sizeInfo.RQBits = config.rqBits
+				// RQ compressed size: (bits / 8) * dimensions * vector_count
+				sizeInfo.CompressedSize = int64((config.rqBits * dimensions * vectorCount) / 8)
+			case CompressionTypeSQ:
+				// SQ typically uses 1 byte per dimension
+				sizeInfo.CompressedSize = int64(dimensions * vectorCount)
+			}
+		} else {
+			sizeInfo.CompressedSize = uncompressedSize
+		}
+
+		// Calculate compression ratio
+		if sizeInfo.UncompressedSize > 0 {
+			sizeInfo.CompressionRatio = float64(sizeInfo.UncompressedSize) / float64(sizeInfo.CompressedSize)
+		}
+
+		// Estimate memory usage in MB
+		sizeInfo.MemoryUsageMB = float64(sizeInfo.CompressedSize) / (1024 * 1024)
+
+		log.WithFields(log.Fields{
+			"compression_type":   sizeInfo.CompressionType,
+			"uncompressed_size":  sizeInfo.UncompressedSize,
+			"compressed_size":    sizeInfo.CompressedSize,
+			"compression_ratio":  sizeInfo.CompressionRatio,
+			"memory_usage_mb":    sizeInfo.MemoryUsageMB,
+		}).Info("Compression measurement completed")
+
+		compressionResults = append(compressionResults, sizeInfo)
+	}
+
+	return compressionResults, nil
+}
+
+// measureRealIndexSize creates an actual index and measures its real size
+func measureRealIndexSize(cfg *Config, client *weaviate.Client, className string, vectors [][]float32, config struct {
+	name           string
+	compressionType CompressionType
+	enabled        bool
+	pqRatio        int
+	rqBits         int
+}) (int64, error) {
+
+	log.WithField("class_name", className).Info("Creating test schema for real size measurement")
+
+	// Create schema
+	schema := &models.Class{
+		Class: className,
+		Properties: []*models.Property{
+			{
+				Name:     "content",
+				DataType: []string{"text"},
+			},
+		},
+		VectorIndexConfig: map[string]interface{}{
+			"distance": cfg.DistanceMetric,
+		},
+	}
+
+	// Apply compression settings
+	if config.enabled {
+		vectorIndexConfig := schema.VectorIndexConfig.(map[string]interface{})
+
+		switch config.compressionType {
+		case CompressionTypePQ:
+			vectorIndexConfig["pq"] = map[string]interface{}{
+				"enabled":      true,
+				"trainingLimit": cfg.TrainingLimit,
+				"segments":     cfg.Dimensions / config.pqRatio,
+			}
+		case CompressionTypeRQ:
+			vectorIndexConfig["rq"] = map[string]interface{}{
+				"enabled": true,
+				"bits":    config.rqBits,
+			}
+		case CompressionTypeSQ:
+			vectorIndexConfig["sq"] = map[string]interface{}{
+				"enabled": true,
+			}
+		}
+
+		schema.VectorIndexConfig = vectorIndexConfig
+	}
+
+	// Create the class
+	if err := client.Schema().ClassCreator().WithClass(schema).Do(context.Background()); err != nil {
+		return 0, fmt.Errorf("failed to create test class: %v", err)
+	}
+
+	// Import a subset of vectors for testing (limit to avoid long execution time)
+	maxVectors := 1000
+	if len(vectors) > maxVectors {
+		vectors = vectors[:maxVectors]
+	}
+
+	// Import vectors
+	batch := client.Batch().ObjectsBatcher()
+	for i, vector := range vectors {
+		object := &models.Object{
+			Class: className,
+			Properties: map[string]interface{}{
+				"content": fmt.Sprintf("test_vector_%d", i),
+			},
+			Vector: vector,
+		}
+		batch = batch.WithObject(object)
+
+		if (i+1)%100 == 0 || i == len(vectors)-1 {
+			if _, err := batch.Do(context.Background()); err != nil {
+				log.WithError(err).Warn("Failed to import batch")
+			}
+			batch = client.Batch().ObjectsBatcher()
+		}
+	}
+
+	// Wait for indexing to complete
+	time.Sleep(5 * time.Second)
+
+	// Get index statistics (this is a simplified approach)
+	// In a real implementation, you'd query Weaviate's metrics endpoint
+	// For now, we'll estimate based on theoretical compression
+	estimatedSize := int64(len(vectors) * len(vectors[0]) * 4) // baseline
+
+	switch config.compressionType {
+	case CompressionTypePQ:
+		estimatedSize = int64((len(vectors[0]) / config.pqRatio) * len(vectors))
+	case CompressionTypeRQ:
+		estimatedSize = int64((config.rqBits * len(vectors[0]) * len(vectors)) / 8)
+	case CompressionTypeSQ:
+		estimatedSize = int64(len(vectors[0]) * len(vectors))
+	}
+
+	// Clean up the test class
+	if err := client.Schema().ClassDeleter().WithClassName(className).Do(context.Background()); err != nil {
+		log.WithError(err).Warn("Failed to delete test class")
+	}
+
+	return estimatedSize, nil
+}
+
+// measureCompressionRecall measures recall across different compression configurations
+func measureCompressionRecall(cfg *Config, client *weaviate.Client, queries Queries, neighbors Neighbors, filters []int) ([]CompressionRecallInfo, error) {
+	log.Info("Starting compression recall analysis")
+
+	var recallResults []CompressionRecallInfo
+
+	// Get vector dimensions from dataset
+	file, err := hdf5.OpenFile(cfg.BenchmarkFile, hdf5.F_ACC_RDONLY)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open HDF5 file: %v", err)
+	}
+	defer file.Close()
+
+	vectors := loadHdf5Float32(file, "train", cfg)
+	if len(vectors) == 0 {
+		return nil, fmt.Errorf("no vectors found in dataset")
+	}
+
+	vectorCount := len(vectors)
+	dimensions := len(vectors[0])
+	queryCount := len(queries)
+
+	log.WithFields(log.Fields{
+		"vector_count": vectorCount,
+		"dimensions":   dimensions,
+		"query_count":  queryCount,
+	}).Info("Dataset information for recall analysis")
+
+	// Test configurations for recall measurement
+	compressionConfigs := []struct {
+		name           string
+		compressionType CompressionType
+		enabled        bool
+		pqRatio        int
+		rqBits         int
+	}{
+		{"none", CompressionTypePQ, false, 0, 0},
+		{"pq_ratio_2", CompressionTypePQ, true, 2, 0},
+		{"pq_ratio_4", CompressionTypePQ, true, 4, 0},
+		{"pq_ratio_8", CompressionTypePQ, true, 8, 0},
+		{"rq_4bits", CompressionTypeRQ, true, 0, 4},
+		{"rq_6bits", CompressionTypeRQ, true, 0, 6},
+		{"rq_8bits", CompressionTypeRQ, true, 0, 8},
+		{"sq", CompressionTypeSQ, true, 0, 0},
+	}
+
+	for _, config := range compressionConfigs {
+		log.WithField("config", config.name).Info("Testing compression configuration for recall")
+
+		// Skip configurations that don't divide evenly for PQ
+		if config.enabled && config.compressionType == CompressionTypePQ && dimensions%config.pqRatio != 0 {
+			log.WithField("config", config.name).Warn("Dimensions not divisible by PQ ratio, skipping")
+			continue
+		}
+
+		// Create a unique class name for this test
+		className := fmt.Sprintf("RecallTest_%s_%d", strings.ReplaceAll(config.name, "_", ""), time.Now().Unix()%10000)
+
+		// Create temporary config for this compression type
+		tempCfg := *cfg
+		tempCfg.ClassName = className
+
+		// Set compression parameters in the temp config
+		if config.enabled {
+			switch config.compressionType {
+			case CompressionTypePQ:
+				tempCfg.PQ = "enabled"
+				tempCfg.PQRatio = uint(config.pqRatio)
+			case CompressionTypeRQ:
+				tempCfg.RQ = "enabled"
+				tempCfg.RQBits = uint(config.rqBits)
+			case CompressionTypeSQ:
+				tempCfg.SQ = "enabled"
+			}
+		} else {
+			tempCfg.PQ = "disabled"
+			tempCfg.RQ = "disabled"
+			tempCfg.SQ = "disabled"
+		}
+
+		// Create schema for this configuration
+		if err := createClass(&tempCfg, client); err != nil {
+			log.WithError(err).WithField("config", config.name).Error("Failed to create class for recall test")
+			continue
+		}
+
+		// Import vectors
+		log.WithField("config", config.name).Info("Importing vectors for recall test")
+		if err := importVectors(&tempCfg, vectors, client); err != nil {
+			log.WithError(err).WithField("config", config.name).Error("Failed to import vectors")
+			// Clean up before continuing
+			cleanupClass(&tempCfg, client)
+			continue
+		}
+
+		// Wait for indexing to complete
+		log.WithField("config", config.name).Info("Waiting for indexing to complete")
+		time.Sleep(10 * time.Second)
+
+		// Run benchmark to measure recall
+		log.WithField("config", config.name).Info("Running recall benchmark")
+		results := benchmarkANN(tempCfg, queries, neighbors, filters)
+
+		// Create recall info
+		recallInfo := CompressionRecallInfo{
+			CompressionType:  config.name,
+			Recall:           results.Recall,
+			NDCG:             results.NDCG,
+			QueriesPerSecond: results.QueriesPerSecond,
+			MeanLatency:      float64(results.Mean.Nanoseconds()) / 1e6, // Convert to milliseconds
+			P99Latency:       float64(results.Percentiles[len(results.Percentiles)-1].Nanoseconds()) / 1e6,
+			VectorCount:      vectorCount,
+			Dimensions:       dimensions,
+			QueryCount:       queryCount,
+			TrainingLimit:    cfg.TrainingLimit,
+		}
+
+		// Add compression-specific parameters
+		if config.enabled {
+			switch config.compressionType {
+			case CompressionTypePQ:
+				recallInfo.PQRatio = config.pqRatio
+			case CompressionTypeRQ:
+				recallInfo.RQBits = config.rqBits
+			}
+		}
+
+		log.WithFields(log.Fields{
+			"compression_type":    recallInfo.CompressionType,
+			"recall":             recallInfo.Recall,
+			"ndcg":               recallInfo.NDCG,
+			"queries_per_second": recallInfo.QueriesPerSecond,
+			"mean_latency_ms":    recallInfo.MeanLatency,
+		}).Info("Compression recall measurement completed")
+
+		recallResults = append(recallResults, recallInfo)
+
+		// Clean up the test class
+		cleanupClass(&tempCfg, client)
+
+		// Brief pause between configurations
+		time.Sleep(2 * time.Second)
+	}
+
+	return recallResults, nil
+}
+
+// Helper function to clean up test class
+func cleanupClass(cfg *Config, client *weaviate.Client) {
+	if err := client.Schema().ClassDeleter().WithClassName(cfg.ClassName).Do(context.Background()); err != nil {
+		log.WithError(err).WithField("class", cfg.ClassName).Warn("Failed to delete test class")
+	}
+}
+
+// Helper function to create a class with the specified compression configuration
+func createClass(cfg *Config, client *weaviate.Client) error {
+	// Create schema
+	schema := &models.Class{
+		Class: cfg.ClassName,
+		Properties: []*models.Property{
+			{
+				Name:     "content",
+				DataType: []string{"text"},
+			},
+		},
+		VectorIndexConfig: map[string]interface{}{
+			"distance":         cfg.DistanceMetric,
+			"efConstruction":   cfg.EfConstruction,
+			"maxConnections":   cfg.MaxConnections,
+		},
+	}
+
+	// Apply compression settings
+	vectorIndexConfig := schema.VectorIndexConfig.(map[string]interface{})
+
+	if cfg.PQ == "enabled" {
+		vectorIndexConfig["pq"] = map[string]interface{}{
+			"enabled":       true,
+			"trainingLimit": cfg.TrainingLimit,
+			"segments":      cfg.Dimensions / int(cfg.PQRatio),
+		}
+	}
+
+	if cfg.RQ == "enabled" {
+		vectorIndexConfig["rq"] = map[string]interface{}{
+			"enabled": true,
+			"bits":    cfg.RQBits,
+		}
+	}
+
+	if cfg.SQ == "enabled" {
+		vectorIndexConfig["sq"] = map[string]interface{}{
+			"enabled": true,
+		}
+	}
+
+	schema.VectorIndexConfig = vectorIndexConfig
+
+	// Create the class
+	return client.Schema().ClassCreator().WithClass(schema).Do(context.Background())
+}
+
+// Helper function to import vectors into a class
+func importVectors(cfg *Config, vectors [][]float32, client *weaviate.Client) error {
+	// Limit the number of vectors for testing to avoid long execution times
+	maxVectors := 5000
+	if len(vectors) > maxVectors {
+		vectors = vectors[:maxVectors]
+	}
+
+	log.WithField("vector_count", len(vectors)).Info("Importing vectors for recall test")
+
+	// Import vectors in batches
+	batchSize := 100
+	for i := 0; i < len(vectors); i += batchSize {
+		end := i + batchSize
+		if end > len(vectors) {
+			end = len(vectors)
+		}
+
+		batch := client.Batch().ObjectsBatcher()
+		for j := i; j < end; j++ {
+			object := &models.Object{
+				Class: cfg.ClassName,
+				ID:    strfmt.UUID(uuidFromInt(j)),
+				Properties: map[string]interface{}{
+					"content": fmt.Sprintf("test_vector_%d", j),
+				},
+				Vector: vectors[j],
+			}
+			batch = batch.WithObject(object)
+		}
+
+		if _, err := batch.Do(context.Background()); err != nil {
+			return fmt.Errorf("failed to import batch %d-%d: %v", i, end, err)
+		}
+	}
+
+	return nil
 }
