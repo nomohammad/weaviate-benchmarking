@@ -1,0 +1,30 @@
+---
+version: '3.4'
+services:
+  benchmarker:
+    build: 
+      context: ./benchmarker
+      dockerfile: Dockerfile
+    command: >
+      /app/benchmarker ann-benchmark
+      --vectors ${DATASET:-./datasets/dbpedia-10k-openai-ada002-angular.hdf5 }
+      --distance ${DISTANCE:-cosine}
+      --grpcOrigin ${GRPC_ORIGIN}
+      --httpOrigin ${HTTP_ORIGIN}
+      --httpScheme ${HTTP_SCHEME:-https}
+    environment:
+      - HTTP_AUTH=${HTTP_AUTH}
+    volumes:
+      - $PWD/datasets:/app/datasets
+      - $PWD/results:/app/results
+  metrics-exporter:
+    build:
+      context: ./metrics-exporter
+      dockerfile: Dockerfile
+    ports:
+      - 2120:2120
+    volumes:
+      - $PWD/results:/data
+    depends_on:
+      - benchmarker
+    restart: on-failure
