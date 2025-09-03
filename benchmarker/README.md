@@ -63,6 +63,7 @@ Flags:
   -q, --query                        Do not import data and only run query tests
       --queryDelaySeconds int        How long to wait before querying (default 30) (default 30)
       --queryDuration int            Instead of querying the test dataset once, query for the specified duration in seconds (default 0)
+      --replicationFactor int        Set number of Weaviate replicas (default 1)
       --rescoreLimit int             Rescore limit. If not set, Weaviate will configure it automatically when rescoring is enabled
       --shards int                   Set number of Weaviate shards (default 1)
       --skipAsyncReady               Skip async ready (default false)

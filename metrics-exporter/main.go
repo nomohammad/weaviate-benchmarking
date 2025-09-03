@@ -373,54 +373,54 @@ func isCompressionMetric(metric *prometheus.GaugeVec) bool {
 	return false // For now, we don't reset any metrics to avoid conflicts
 }
 
-func findLatestJSONFile(dirPath string) (string, error) {
-	var latestFile string
-	var latestTime time.Time
+func findAllJSONFiles(dirPath string) ([]string, error) {
+	var jsonFiles []string
 
 	err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if filepath.Ext(path) == ".json" && !info.IsDir() {
-			if info.ModTime().After(latestTime) {
-				latestTime = info.ModTime()
-				latestFile = path
-			}
+			jsonFiles = append(jsonFiles, path)
 		}
 		return nil
 	})
 
 	if err != nil {
-		return "", fmt.Errorf("error walking directory: %v", err)
+		return nil, fmt.Errorf("error walking directory: %v", err)
 	}
 
-	if latestFile == "" {
-		return "", fmt.Errorf("awaiting results")
-	}
-
-	return latestFile, nil
+	return jsonFiles, nil
 }
 
 func pollDirectory(dirPath string, exporter *Exporter) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	var lastProcessedFile string
+	processedFiles := make(map[string]bool)
 
 	for range ticker.C {
-		latestFile, err := findLatestJSONFile(dirPath)
+		jsonFiles, err := findAllJSONFiles(dirPath)
 		if err != nil {
-			log.Printf("Unable to public metrics: %v", err)
+			log.Printf("Unable to find JSON files: %v", err)
 			continue
 		}
 
-		// Only process if it's a new file or hasn't been processed yet
-		if latestFile != lastProcessedFile {
-			if err := exporter.processJSONFile(latestFile); err != nil {
-				log.Printf("Error processing file %s: %v", latestFile, err)
-				continue
+		if len(jsonFiles) == 0 {
+			log.Printf("No JSON files found in directory: %s", dirPath)
+			continue
+		}
+
+		// Process each file that hasn't been processed yet
+		for _, filePath := range jsonFiles {
+			if !processedFiles[filePath] {
+				if err := exporter.processJSONFile(filePath); err != nil {
+					log.Printf("Error processing file %s: %v", filePath, err)
+					continue
+				}
+				processedFiles[filePath] = true
+				log.Printf("Successfully processed new file: %s", filePath)
 			}
-			lastProcessedFile = latestFile
 		}
 	}
 }

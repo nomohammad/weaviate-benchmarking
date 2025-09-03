@@ -1155,7 +1155,7 @@ func runQueries(cfg *Config, importTime time.Duration, testData [][]float32, nei
 			}
 
 			recallData, _ := json.MarshalIndent(recallResults, "", "  ")
-			recallPath := fmt.Sprintf("./results/%s", recallFile)
+			recallPath := fmt.Sprintf("../results/%s", recallFile)
 			if err := os.WriteFile(recallPath, recallData, 0644); err != nil {
 				log.WithError(err).Error("Failed to save compression recall analysis results")
 			} else {
@@ -1181,7 +1181,7 @@ func runQueries(cfg *Config, importTime time.Duration, testData [][]float32, nei
 		log.Fatalf("Error marshaling benchmark results: %v", err)
 	}
 
-	os.Mkdir("./results", 0o755)
+	os.Mkdir("../results", 0o755)
 
 	// Use OutputFile if specified, otherwise use the generated filename in results directory
 	var outputPath string
@@ -1192,7 +1192,7 @@ func runQueries(cfg *Config, importTime time.Duration, testData [][]float32, nei
 			os.MkdirAll(dir, 0o755)
 		}
 	} else {
-		outputPath = fmt.Sprintf("./results/%s", filename)
+		outputPath = fmt.Sprintf("../results/%s", filename)
 	}
 
 	err = os.WriteFile(outputPath, data, 0o644)
@@ -1277,9 +1277,9 @@ var annBenchmarkCommand = &cobra.Command{
 				}
 
 				// Ensure results directory exists
-				os.Mkdir("./results", 0o755)
+				os.Mkdir("../results", 0o755)
 
-				compressionPath := fmt.Sprintf("./results/%s", compressionFile)
+				compressionPath := fmt.Sprintf("../results/%s", compressionFile)
 				compressionData, _ := json.MarshalIndent(compressionResults, "", "  ")
 				if err := os.WriteFile(compressionPath, compressionData, 0644); err != nil {
 					log.WithError(err).Error("Failed to save compression analysis results")
