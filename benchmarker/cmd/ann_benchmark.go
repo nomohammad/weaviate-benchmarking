@@ -1047,7 +1047,7 @@ func parseEfValues(s string) ([]int, error) {
 	return nums, nil
 }
 
-func runQueries(cfg *Config, importTime time.Duration, testData [][]float32, neighbors [][]int, filters []int) {
+func runQueries(cfg *Config, importTime time.Duration, testData [][]float32, neighbors [][]int, filters []int, compressionSizeResults []CompressionSizeInfo) {
 	runID := strconv.FormatInt(time.Now().Unix(), 10)
 
 	// Generate filename with bench_ prefix and optional experiment name
@@ -1058,14 +1058,10 @@ func runQueries(cfg *Config, importTime time.Duration, testData [][]float32, nei
 		filename = fmt.Sprintf("bench_%s.json", runID)
 	}
 
-	efCandidates, err := parseEfValues(cfg.EfArray)
-	if err != nil {
-		log.Fatalf("Error parsing efArray, expected commas separated format \"16,32,64\" but:%v\n", err)
-	}
-
 	// Read once at this point (after import and compaction delay) to get accurate memory stats
 	memstats := &Memstats{}
 	if !cfg.SkipMemoryStats {
+		var err error
 		memstats, err = readMemoryMetrics(cfg)
 		if err != nil {
 			log.Warnf("Error reading memory stats: %v", err)
@@ -1076,70 +1072,53 @@ func runQueries(cfg *Config, importTime time.Duration, testData [][]float32, nei
 	client := createClient(cfg)
 
 	var benchmarkResultsMap []map[string]interface{}
-	for _, ef := range efCandidates {
-		updateEf(ef, cfg, client)
+	dataset := filepath.Base(cfg.BenchmarkFile)
 
-		var result Results
+	// If compression size analysis results are provided, use them as the main output
+	if len(compressionSizeResults) > 0 {
+		log.Info("Using compression size analysis results as main output")
 
-		if cfg.QueryDuration > 0 {
-			result = benchmarkANNDuration(*cfg, testData, neighbors, filters)
-		} else {
-			result = benchmarkANN(*cfg, testData, neighbors, filters)
-		}
-
-		log.WithFields(log.Fields{
-			"mean": result.Mean, "qps": result.QueriesPerSecond, "recall": result.Recall, "ndcg": result.NDCG,
-			"parallel": cfg.Parallel, "limit": cfg.Limit,
-			"api": cfg.API, "ef": ef, "count": result.Total, "failed": result.Failed,
-		}).Info("Benchmark result")
-
-		dataset := filepath.Base(cfg.BenchmarkFile)
-
-		var resultMap map[string]interface{}
-
-		benchResult := ResultsJSONBenchmark{
-			Api:              cfg.API,
-			Ef:               ef,
-			EfConstruction:   cfg.EfConstruction,
-			MaxConnections:   cfg.MaxConnections,
-			Mean:             result.Mean.Seconds(),
-			P99Latency:       result.Percentiles[len(result.Percentiles)-1].Seconds(),
-			QueriesPerSecond: result.QueriesPerSecond,
-			Shards:           cfg.Shards,
-			Parallelization:  cfg.Parallel,
-			Limit:            cfg.Limit,
-			ImportTime:       importTime.Seconds(),
-			RunID:            runID,
-			Dataset:          dataset,
-			NDCG:             result.NDCG,
-			Recall:           result.Recall,
-			HeapAllocBytes:   memstats.HeapAllocBytes,
-			HeapInuseBytes:   memstats.HeapInuseBytes,
-			HeapSysBytes:     memstats.HeapSysBytes,
-			Timestamp:        time.Now().Format(time.RFC3339),
-		}
-
-		jsonData, err := json.Marshal(benchResult)
-		if err != nil {
-			log.Fatalf("Error converting result to json")
-		}
-
-		if err := json.Unmarshal(jsonData, &resultMap); err != nil {
-			log.Fatalf("Error converting json to map")
-		}
-
-		if cfg.LabelMap != nil {
-			for key, value := range cfg.LabelMap {
-				resultMap[key] = value
+		// Convert compression size results to benchmarkResultsMap format
+		for _, result := range compressionSizeResults {
+			resultMap := map[string]interface{}{
+				"api":                   cfg.API,
+				"compressionType":       result.CompressionType,
+				"uncompressedSizeBytes": result.UncompressedSize,
+				"compressedSizeBytes":   result.CompressedSize,
+				"compressionRatio":      result.CompressionRatio,
+				"memoryUsageMB":         result.MemoryUsageMB,
+				"vectorCount":           result.VectorCount,
+				"dimensions":            result.Dimensions,
+				"importTime":            importTime.Seconds(),
+				"runID":                 runID,
+				"dataset":               dataset,
+				"heap_alloc_bytes":      memstats.HeapAllocBytes,
+				"heap_inuse_bytes":      memstats.HeapInuseBytes,
+				"heap_sys_bytes":        memstats.HeapSysBytes,
+				"timestamp":             time.Now().Format(time.RFC3339),
+				"trainingLimit":         result.TrainingLimit,
 			}
+
+			// Add compression-specific parameters
+			if result.PQRatio > 0 {
+				resultMap["pqRatio"] = result.PQRatio
+			}
+			if result.RQBits > 0 {
+				resultMap["rqBits"] = result.RQBits
+			}
+			if result.SegmentCount > 0 {
+				resultMap["segmentCount"] = result.SegmentCount
+			}
+
+			if cfg.LabelMap != nil {
+				for key, value := range cfg.LabelMap {
+					resultMap[key] = value
+				}
+			}
+
+			benchmarkResultsMap = append(benchmarkResultsMap, resultMap)
 		}
-
-		benchmarkResultsMap = append(benchmarkResultsMap, resultMap)
-
-	}
-
-	// Run compression recall analysis if requested
-	if cfg.CompressionRecallAnalysis {
+	} else if cfg.CompressionRecallAnalysis {
 		log.Info("Starting compression recall analysis")
 		recallResults, err := measureCompressionRecall(cfg, client, testData, neighbors, filters)
 		if err != nil {
@@ -1147,19 +1126,44 @@ func runQueries(cfg *Config, importTime time.Duration, testData [][]float32, nei
 		} else {
 			log.WithField("results_count", len(recallResults)).Info("Compression recall analysis completed")
 
-			// Save recall analysis results to file
-			recallFile := fmt.Sprintf("compression_recall_%s_%s.json",
-				cfg.ExperimentName, runID)
-			if cfg.ExperimentName == "" {
-				recallFile = fmt.Sprintf("compression_recall_%s.json", runID)
-			}
+			// Convert compression recall results to benchmarkResultsMap format
+			for _, result := range recallResults {
+				resultMap := map[string]interface{}{
+					"api":              cfg.API,
+					"compressionType":  result.CompressionType,
+					"meanLatency":      result.MeanLatency / 1000.0, // Convert ms to seconds for consistency
+					"p99Latency":       result.P99Latency / 1000.0,  // Convert ms to seconds for consistency
+					"qps":              result.QueriesPerSecond,
+					"recall":           result.Recall,
+					"ndcg":             result.NDCG,
+					"vectorCount":      result.VectorCount,
+					"dimensions":       result.Dimensions,
+					"queryCount":       result.QueryCount,
+					"importTime":       importTime.Seconds(),
+					"runID":            runID,
+					"dataset":          dataset,
+					"heap_alloc_bytes": memstats.HeapAllocBytes,
+					"heap_inuse_bytes": memstats.HeapInuseBytes,
+					"heap_sys_bytes":   memstats.HeapSysBytes,
+					"timestamp":        time.Now().Format(time.RFC3339),
+					"trainingLimit":    result.TrainingLimit,
+				}
 
-			recallData, _ := json.MarshalIndent(recallResults, "", "  ")
-			recallPath := fmt.Sprintf("../results/%s", recallFile)
-			if err := os.WriteFile(recallPath, recallData, 0644); err != nil {
-				log.WithError(err).Error("Failed to save compression recall analysis results")
-			} else {
-				log.WithField("file", recallPath).Info("Compression recall analysis results saved")
+				// Add compression-specific parameters
+				if result.PQRatio > 0 {
+					resultMap["pqRatio"] = result.PQRatio
+				}
+				if result.RQBits > 0 {
+					resultMap["rqBits"] = result.RQBits
+				}
+
+				if cfg.LabelMap != nil {
+					for key, value := range cfg.LabelMap {
+						resultMap[key] = value
+					}
+				}
+
+				benchmarkResultsMap = append(benchmarkResultsMap, resultMap)
 			}
 
 			// Print summary
@@ -1173,6 +1177,71 @@ func runQueries(cfg *Config, importTime time.Duration, testData [][]float32, nei
 					"mean_latency_ms":    result.MeanLatency,
 				}).Info("Recall measurement")
 			}
+		}
+	} else {
+		// Run normal benchmark queries only if no compression recall analysis
+		efCandidates, err := parseEfValues(cfg.EfArray)
+		if err != nil {
+			log.Fatalf("Error parsing efArray, expected commas separated format \"16,32,64\" but:%v\n", err)
+		}
+
+		for _, ef := range efCandidates {
+			updateEf(ef, cfg, client)
+
+			var result Results
+
+			if cfg.QueryDuration > 0 {
+				result = benchmarkANNDuration(*cfg, testData, neighbors, filters)
+			} else {
+				result = benchmarkANN(*cfg, testData, neighbors, filters)
+			}
+
+			log.WithFields(log.Fields{
+				"mean": result.Mean, "qps": result.QueriesPerSecond, "recall": result.Recall, "ndcg": result.NDCG,
+				"parallel": cfg.Parallel, "limit": cfg.Limit,
+				"api": cfg.API, "ef": ef, "count": result.Total, "failed": result.Failed,
+			}).Info("Benchmark result")
+
+			var resultMap map[string]interface{}
+
+			benchResult := ResultsJSONBenchmark{
+				Api:              cfg.API,
+				Ef:               ef,
+				EfConstruction:   cfg.EfConstruction,
+				MaxConnections:   cfg.MaxConnections,
+				Mean:             result.Mean.Seconds(),
+				P99Latency:       result.Percentiles[len(result.Percentiles)-1].Seconds(),
+				QueriesPerSecond: result.QueriesPerSecond,
+				Shards:           cfg.Shards,
+				Parallelization:  cfg.Parallel,
+				Limit:            cfg.Limit,
+				ImportTime:       importTime.Seconds(),
+				RunID:            runID,
+				Dataset:          dataset,
+				NDCG:             result.NDCG,
+				Recall:           result.Recall,
+				HeapAllocBytes:   memstats.HeapAllocBytes,
+				HeapInuseBytes:   memstats.HeapInuseBytes,
+				HeapSysBytes:     memstats.HeapSysBytes,
+				Timestamp:        time.Now().Format(time.RFC3339),
+			}
+
+			jsonData, err := json.Marshal(benchResult)
+			if err != nil {
+				log.Fatalf("Error converting result to json")
+			}
+
+			if err := json.Unmarshal(jsonData, &resultMap); err != nil {
+				log.Fatalf("Error converting json to map")
+			}
+
+			if cfg.LabelMap != nil {
+				for key, value := range cfg.LabelMap {
+					resultMap[key] = value
+				}
+			}
+
+			benchmarkResultsMap = append(benchmarkResultsMap, resultMap)
 		}
 	}
 
@@ -1261,13 +1330,15 @@ var annBenchmarkCommand = &cobra.Command{
 		}).Info("Detected dataset format")
 
 		// Run compression size analysis if requested (before creating client)
+		var compressionSizeResults []CompressionSizeInfo
 		if cfg.CompressionSizeAnalysis {
 			log.Info("Starting compression size analysis")
-			compressionResults, err := measureCompressionIndexSize(&cfg, nil)
+			results, err := measureCompressionIndexSize(&cfg, nil)
 			if err != nil {
 				log.WithError(err).Error("Failed to measure compression index sizes")
 			} else {
-				log.WithField("results_count", len(compressionResults)).Info("Compression size analysis completed")
+				compressionSizeResults = results
+				log.WithField("results_count", len(compressionSizeResults)).Info("Compression size analysis completed")
 
 				// Save compression results to file
 				compressionFile := fmt.Sprintf("compression_analysis_%s_%d.json",
@@ -1280,7 +1351,7 @@ var annBenchmarkCommand = &cobra.Command{
 				os.Mkdir("../results", 0o755)
 
 				compressionPath := fmt.Sprintf("../results/%s", compressionFile)
-				compressionData, _ := json.MarshalIndent(compressionResults, "", "  ")
+				compressionData, _ := json.MarshalIndent(compressionSizeResults, "", "  ")
 				if err := os.WriteFile(compressionPath, compressionData, 0644); err != nil {
 					log.WithError(err).Error("Failed to save compression analysis results")
 				} else {
@@ -1289,7 +1360,7 @@ var annBenchmarkCommand = &cobra.Command{
 
 				// Print summary
 				log.Info("Compression Analysis Summary:")
-				for _, result := range compressionResults {
+				for _, result := range compressionSizeResults {
 					log.WithFields(log.Fields{
 						"type":              result.CompressionType,
 						"compression_ratio": fmt.Sprintf("%.2fx", result.CompressionRatio),
@@ -1354,7 +1425,7 @@ var annBenchmarkCommand = &cobra.Command{
 			testFilters = loadHdf5Categories(file, "test_categories")
 		}
 
-		runQueries(&cfg, importTime, testData, neighbors, testFilters)
+		runQueries(&cfg, importTime, testData, neighbors, testFilters, compressionSizeResults)
 
 		if cfg.performUpdates() {
 
@@ -1387,7 +1458,9 @@ var annBenchmarkCommand = &cobra.Command{
 					waitReady(&cfg, client, startTime, 30*time.Minute, 1000)
 				}
 
-				runQueries(&cfg, importTime, testData, neighbors, testFilters)
+				// For update iterations, don't use compression size results
+				var emptyCompressionResults []CompressionSizeInfo
+				runQueries(&cfg, importTime, testData, neighbors, testFilters, emptyCompressionResults)
 
 			}
 
@@ -1522,6 +1595,8 @@ func initAnnBenchmark() {
 		"compressionSizeAnalysis", false, "Enable compression index size measurement analysis")
 	annBenchmarkCommand.PersistentFlags().BoolVar(&globalConfig.CompressionRecallAnalysis,
 		"compressionRecallAnalysis", false, "Enable compression recall measurement and comparison analysis")
+	annBenchmarkCommand.PersistentFlags().IntVar(&globalConfig.VectorCount,
+		"vectorCount", 0, "Number of vectors to use from dataset (0 = use all vectors in dataset)")
 }
 
 func benchmarkANN(cfg Config, queries Queries, neighbors Neighbors, filters []int) Results {
@@ -1672,6 +1747,11 @@ func measureCompressionIndexSize(cfg *Config, client *weaviate.Client) ([]Compre
 	}
 
 	vectorCount := len(vectors)
+	// Use configurable vector count if specified and valid
+	if cfg.VectorCount > 0 && cfg.VectorCount <= len(vectors) {
+		vectorCount = cfg.VectorCount
+		log.WithField("configured_vector_count", cfg.VectorCount).Info("Using configured vector count instead of full dataset")
+	}
 	dimensions := len(vectors[0])
 
 	log.WithFields(log.Fields{
@@ -1757,112 +1837,6 @@ func measureCompressionIndexSize(cfg *Config, client *weaviate.Client) ([]Compre
 	return compressionResults, nil
 }
 
-// measureRealIndexSize creates an actual index and measures its real size
-func measureRealIndexSize(cfg *Config, client *weaviate.Client, className string, vectors [][]float32, config struct {
-	name            string
-	compressionType CompressionType
-	enabled         bool
-	pqRatio         int
-	rqBits          int
-}) (int64, error) {
-
-	log.WithField("class_name", className).Info("Creating test schema for real size measurement")
-
-	// Create schema
-	schema := &models.Class{
-		Class: className,
-		Properties: []*models.Property{
-			{
-				Name:     "content",
-				DataType: []string{"text"},
-			},
-		},
-		VectorIndexConfig: map[string]interface{}{
-			"distance": cfg.DistanceMetric,
-		},
-	}
-
-	// Apply compression settings
-	if config.enabled {
-		vectorIndexConfig := schema.VectorIndexConfig.(map[string]interface{})
-
-		switch config.compressionType {
-		case CompressionTypePQ:
-			vectorIndexConfig["pq"] = map[string]interface{}{
-				"enabled":       true,
-				"trainingLimit": cfg.TrainingLimit,
-				"segments":      cfg.Dimensions / config.pqRatio,
-			}
-		case CompressionTypeRQ:
-			vectorIndexConfig["rq"] = map[string]interface{}{
-				"enabled": true,
-				"bits":    config.rqBits,
-			}
-		case CompressionTypeSQ:
-			vectorIndexConfig["sq"] = map[string]interface{}{
-				"enabled": true,
-			}
-		}
-
-		schema.VectorIndexConfig = vectorIndexConfig
-	}
-
-	// Create the class
-	if err := client.Schema().ClassCreator().WithClass(schema).Do(context.Background()); err != nil {
-		return 0, fmt.Errorf("failed to create test class: %v", err)
-	}
-
-	// Import a subset of vectors for testing (limit to avoid long execution time)
-	maxVectors := 1000
-	if len(vectors) > maxVectors {
-		vectors = vectors[:maxVectors]
-	}
-
-	// Import vectors
-	batch := client.Batch().ObjectsBatcher()
-	for i, vector := range vectors {
-		object := &models.Object{
-			Class: className,
-			Properties: map[string]interface{}{
-				"content": fmt.Sprintf("test_vector_%d", i),
-			},
-			Vector: vector,
-		}
-		batch = batch.WithObject(object)
-
-		if (i+1)%100 == 0 || i == len(vectors)-1 {
-			if _, err := batch.Do(context.Background()); err != nil {
-				log.WithError(err).Warn("Failed to import batch")
-			}
-			batch = client.Batch().ObjectsBatcher()
-		}
-	}
-
-	// Wait for indexing to complete
-	time.Sleep(5 * time.Second)
-
-	// Get index statistics (this is a simplified approach)
-	// In a real implementation, you'd query Weaviate's metrics endpoint
-	// For now, we'll estimate based on theoretical compression
-	estimatedSize := int64(len(vectors) * len(vectors[0]) * 4) // baseline
-
-	switch config.compressionType {
-	case CompressionTypePQ:
-		estimatedSize = int64((len(vectors[0]) / config.pqRatio) * len(vectors))
-	case CompressionTypeRQ:
-		estimatedSize = int64((config.rqBits * len(vectors[0]) * len(vectors)) / 8)
-	case CompressionTypeSQ:
-		estimatedSize = int64(len(vectors[0]) * len(vectors))
-	}
-
-	// Clean up the test class
-	if err := client.Schema().ClassDeleter().WithClassName(className).Do(context.Background()); err != nil {
-		log.WithError(err).Warn("Failed to delete test class")
-	}
-
-	return estimatedSize, nil
-}
-
 // measureCompressionRecall measures recall across different compression configurations
 func measureCompressionRecall(cfg *Config, client *weaviate.Client, queries Queries, neighbors Neighbors, filters []int) ([]CompressionRecallInfo, error) {
 	log.Info("Starting compression recall analysis")
@@ -1882,6 +1856,11 @@ func measureCompressionRecall(cfg *Config, client *weaviate.Client, queries Quer
 	}
 
 	vectorCount := len(vectors)
+	// Use configurable vector count if specified and valid
+	if cfg.VectorCount > 0 && cfg.VectorCount <= len(vectors) {
+		vectorCount = cfg.VectorCount
+		log.WithField("configured_vector_count", cfg.VectorCount).Info("Using configured vector count for recall analysis")
+	}
 	dimensions := len(vectors[0])
 	queryCount := len(queries)
 
@@ -2067,12 +2046,24 @@ func createClass(cfg *Config, client *weaviate.Client) error {
 
 // Helper function to import vectors into a class
 func importVectors(cfg *Config, vectors [][]float32, client *weaviate.Client) error {
-	// Limit the number of vectors for testing to avoid long execution times
-	maxVectors := 5000
+	// Validate and set vector count - default to all available vectors if not specified or invalid
+	maxVectors := len(vectors) // Default to all available vectors
+	if cfg.VectorCount > 0 && cfg.VectorCount <= len(vectors) {
+		maxVectors = cfg.VectorCount
+		log.WithField("configured_vector_count", cfg.VectorCount).Info("Using configured vector count for import")
+	} else if cfg.VectorCount > len(vectors) {
+		log.WithFields(log.Fields{
+			"requested_count": cfg.VectorCount,
+			"available_count": len(vectors),
+		}).Warn("Requested vector count exceeds available vectors, using all available vectors")
+	} else {
+		log.WithField("available_count", len(vectors)).Info("Using all available vectors for import")
+	}
+
+	// Limit vectors to the determined count
 	if len(vectors) > maxVectors {
 		vectors = vectors[:maxVectors]
 	}
-
 	log.WithField("vector_count", len(vectors)).Info("Importing vectors for recall test")
 
 	// Import vectors in batches
